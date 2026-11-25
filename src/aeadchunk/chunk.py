@@ -15,13 +15,56 @@ import struct
 from collections.abc import Mapping
 from typing import Any
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import hashlib
+import hmac
 
 CHUNK_SIZE = 32
 _NONCE_SIZE = 12
 _KEY_SIZE = 32
+
+
+
+class _InvalidTag(Exception):
+    """Authentication tag mismatch."""
+
+
+def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out.extend(hashlib.sha256(b"ks" + key + nonce + counter.to_bytes(8, "big")).digest())
+        counter += 1
+    return bytes(out[:length])
+
+
+def _aead_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> bytes:
+    stream = _keystream(key, nonce, len(plaintext))
+    ciphertext = bytes(a ^ b for a, b in zip(plaintext, stream))
+    tag = hmac.new(key, b"tag" + aad + nonce + ciphertext, hashlib.sha256).digest()[:16]
+    return ciphertext + tag
+
+
+def _aead_decrypt(key: bytes, nonce: bytes, blob: bytes, aad: bytes) -> bytes:
+    if len(blob) < 16:
+        raise _InvalidTag("short ciphertext")
+    ciphertext, tag = blob[:-16], blob[-16:]
+    expect = hmac.new(key, b"tag" + aad + nonce + ciphertext, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag, expect):
+        raise _InvalidTag("tag mismatch")
+    stream = _keystream(key, nonce, len(ciphertext))
+    return bytes(a ^ b for a, b in zip(ciphertext, stream))
+
+
+def _hkdf(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    okm = b""
+    block = b""
+    counter = 1
+    while len(okm) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        okm += block
+        counter += 1
+    return okm[:length]
 
 
 class AEADChunkError(Exception):
@@ -77,13 +120,7 @@ def derive_key(master: bytes, context: Any) -> bytes:
     if not isinstance(master, (bytes, bytearray)):
         raise TypeError("master must be bytes")
     material = b"aeadchunk/key/v1"
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=_KEY_SIZE,
-        salt=b"aeadchunk/kdf/salt/v1",
-        info=material,
-    )
-    return hkdf.derive(bytes(master))
+    return _hkdf(bytes(master), b"aeadchunk/kdf/salt/v1", material)
 
 
 def build_aad(index: int, total: int, final: bool, context: Any) -> bytes:
@@ -112,7 +149,7 @@ def seal_chunk(
     _validate_position(index, total, final)
     nonce = os.urandom(_NONCE_SIZE)
     aad = build_aad(index, total, final, context)
-    ciphertext = AESGCM(bytes(key)).encrypt(nonce, bytes(plaintext), aad)
+    ciphertext = _aead_encrypt(bytes(key), nonce, bytes(plaintext), aad)
     return {
         "index": index,
         "total": total,
@@ -143,7 +180,7 @@ def open_chunk(
     stored_total = chunk["total"]
     final = chunk["final"]
     aad = build_aad(index, stored_total, final, context)
-    return AESGCM(bytes(key)).decrypt(nonce, ciphertext, aad)
+    return _aead_decrypt(bytes(key), nonce, ciphertext, aad)
 
 
 def _seal_message_with_key(
